@@ -76,6 +76,14 @@ def proxy(which=0, timeout=10):
     return req("GET", GW[which] + "/proxy", timeout=timeout)
 
 
+def rejected_or_degraded(status, body, reason):
+    """A breaker rejection is now either a plain 503 or a degraded replica
+    response (HTTP 200 + degraded:true) carrying the same reject reason."""
+    if body.get("degraded"):
+        return status == 200 and body.get("reject_reason") == reason
+    return status == 503 and body.get("reason") == reason
+
+
 def wait_state(expected, timeout=8, which=0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -123,8 +131,10 @@ def main():
     check("breaker OPEN", wait_state("OPEN"), str(state()))
     s1, b1 = proxy(0)
     s2, b2 = proxy(1)
-    check("gateway-1 fast-rejects 503", s1 == 503 and b1["reason"] == "circuit_open", str(b1))
-    check("gateway-2 fast-rejects 503", s2 == 503 and b2["reason"] == "circuit_open", str(b2))
+    check("gateway-1 fast-rejects (503 or degraded replica)",
+          rejected_or_degraded(s1, b1, "circuit_open"), str(b1))
+    check("gateway-2 fast-rejects (503 or degraded replica)",
+          rejected_or_degraded(s2, b2, "circuit_open"), str(b2))
     _, up_before = req("GET", UP + "/mode")
     calls_before = up_before["calls"]
     proxy(0); proxy(1)
@@ -136,7 +146,8 @@ def main():
     set_mode("normal")  # upstream recovered; breaker still cooling down
     time.sleep(0.5)
     s, b = proxy(0)
-    check("still rejecting within 2s cooldown", s == 503 and b["reason"] == "circuit_open", str(b))
+    check("still rejecting within 2s cooldown (503 or degraded)",
+          rejected_or_degraded(s, b, "circuit_open"), str(b))
     time.sleep(2.0)
 
     # 4a. fast upstream: probe may close before peer threads start, so peers
@@ -166,10 +177,12 @@ def main():
         outcomes = list(pool.map(lambda i: proxy(i % 2, timeout=8), range(8)))
     wall = time.time() - t0
     probes = [o for o in outcomes if o[1].get("outcome") == "timeout"]
-    rejects = [o for o in outcomes if o[0] == 503 and o[1].get("reason") == "probe_in_flight"]
+    rejects = [o for o in outcomes
+               if rejected_or_degraded(o[0], o[1], "probe_in_flight")]
     check("exactly one probe while probe in flight", len(probes) == 1,
           str([(c, b.get("reason") or b.get("outcome")) for c, b in outcomes]))
-    check("other 7 requests rejected immediately", len(rejects) == 7, str(len(rejects)))
+    check("other 7 requests rejected immediately (503 or degraded replica)",
+          len(rejects) == 7, str(len(rejects)))
     check("rejections were immediate (no upstream wait)", wall < 3.0, f"{wall:.2f}s")
     check("failed probe reopened breaker", wait_state("OPEN"), str(state()))
     set_mode("normal")
@@ -188,7 +201,8 @@ def main():
     check("probe is attempted (got upstream 500)", s == 500 and b["outcome"] == "upstream_5xx", str(b))
     check("probe failure re-opens", wait_state("OPEN"), str(state()))
     s, b = proxy(1)
-    check("cooldown restarted, still 503", s == 503 and b["reason"] == "circuit_open", str(b))
+    check("cooldown restarted, still rejected (503 or degraded)",
+          rejected_or_degraded(s, b, "circuit_open"), str(b))
     set_mode("normal")
     time.sleep(2.3)
     s, b = proxy(0)
@@ -224,8 +238,9 @@ def main():
         s, b = proxy(0)
         check("third failure opens breaker", s == 502 and wait_state("OPEN"), str(b))
         # restart upstream
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         env = dict(os.environ)
-        env.setdefault("PYTHONPATH", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        env["PYTHONPATH"] = repo_root
         log = open(os.path.join(os.path.dirname(pidfile), "flaky-upstream.log"), "a")
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.upstream_app:app",
@@ -259,9 +274,10 @@ def main():
         st = state(1)
         check("gateway-1 owns the in-flight probe",
               st["state"] == "HALF_OPEN" and st["probe_instance"] == "gateway-1", str(st))
-        # other requests are rejected meanwhile
+        # other requests are rejected meanwhile (503 or a degraded replica)
         s, b = proxy(1)
-        check("gateway-2 rejected while probe held", s == 503 and b["reason"] == "probe_in_flight", str(b))
+        check("gateway-2 rejected while probe held",
+              rejected_or_degraded(s, b, "probe_in_flight"), str(b))
         # kill gateway-1 mid-probe
         gw1_pid = int(open(os.path.join(os.path.dirname(pidfile), "gateway-1.pid")).read().strip())
         os.kill(gw1_pid, signal.SIGTERM)
@@ -277,6 +293,7 @@ def main():
         check("reclaimed probe failure reopens", st["state"] == "OPEN", str(st))
         # restart gateway-1: shared DB means it sees the same state, no corruption
         env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         env.update({
             "INSTANCE_ID": "gateway-1",
             "UPSTREAM_URL": f"http://127.0.0.1:{UP.rsplit(':', 1)[1]}",
@@ -285,6 +302,7 @@ def main():
             "CB_FAILURE_THRESHOLD": "3",
             "CB_COOLDOWN_SECONDS": "2",
             "CB_PROBE_TIMEOUT_SECONDS": "3",
+            "CB_FALLBACK_TTL_SECONDS": os.getenv("CB_FALLBACK_TTL_SECONDS", "4"),
         })
         glog = open(os.path.join(os.path.dirname(pidfile), "gateway-1.log"), "a")
         g1 = subprocess.Popen(
@@ -312,6 +330,161 @@ def main():
     instances = {e["instance"] for e in ev["events"]}
     check("events from both gateway instances",
           {"gateway-1", "gateway-2"}.issubset(instances), str(instances))
+
+    print("== 9. shared fallback replica (degraded GET while breaker rejects) ==")
+    ttl = state()["fallback_ttl_seconds"]
+    check("fallback TTL advertised by breaker", isinstance(ttl, (int, float)) and ttl > 0, str(ttl))
+
+    # 9.0 remove any replica captured by earlier sections so the "no replica"
+    #     branch can be exercised against the shared DB of the live gateways.
+    import sqlite3 as _sqlite3
+    db_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "breaker.db"))
+    if os.path.exists(db_path):
+        _c = _sqlite3.connect(db_path)
+        _c.execute("DELETE FROM fallback_replica")
+        _c.commit()
+        _c.close()
+    set_mode("normal")
+    assert wait_state("CLOSED")
+    s, b = req("GET", GW[0] + "/api/replica")
+    check("no replica before first success", s == 200 and b["replica"] is None, str(b))
+
+    # 9.1 a confirmed success captures the replica (remember the upstream body)
+    s, b = proxy(0)
+    assert s == 200 and b["outcome"] == "success", str(b)
+    captured_body = b["upstream_body"]
+    s, b = req("GET", GW[0] + "/api/replica")
+    rep = b["replica"]
+    check("success stored shared replica",
+          s == 200 and rep and rep["status_code"] == 200
+          and rep["body"] == captured_body and rep["fresh"], str(b))
+    captured_version = rep["version"]
+    capture_epoch = rep["captured_at"]
+
+    # 9.2 trip the breaker; while OPEN, both entries serve the degraded replica
+    set_mode("error")
+    for _ in range(3):
+        proxy(0)
+    check("breaker OPEN for fallback drill", wait_state("OPEN"), str(state()))
+    s, b = proxy(0)
+    check("gateway-1 serves degraded replica (upstream status preserved)",
+          s == rep["status_code"] and b.get("degraded") is True
+          and b["upstream_body"] == captured_body
+          and b["fallback"]["upstream_status"] == rep["status_code"], str(b))
+    s2, b2 = proxy(1)
+    check("gateway-2 serves the same shared replica",
+          s2 == rep["status_code"] and b2.get("degraded") is True
+          and b2["upstream_body"] == captured_body
+          and b2["fallback"]["version"] == captured_version, str(b2))
+    check("degraded payload carries capture time and reject reason",
+          b["fallback"]["captured_at_iso"] and b["fallback"]["age_seconds"] >= 0
+          and b["reject_reason"] == "circuit_open", str(b))
+    # marker headers for non-browser clients
+    import urllib.request as _ur
+    hr = _ur.urlopen(_ur.Request(GW[1] + "/proxy"), timeout=5)
+    try:
+        check("degraded response headers marked",
+              hr.headers.get("X-Gateway-Degraded") == "1"
+              and hr.headers.get("Warning", "").startswith("110 ")
+              and hr.headers.get("X-Replica-Version") == str(captured_version),
+              str(dict(hr.headers)))
+    finally:
+        hr.read()
+
+    # 9.3 reads never extend the replica lifetime
+    s, b = req("GET", GW[0] + "/api/replica")
+    age1 = b["replica"]["age_seconds"]
+    time.sleep(1.0)
+    for _ in range(5):
+        proxy(1)  # degraded reads
+    req("GET", GW[0] + "/api/replica")
+    s, b = req("GET", GW[1] + "/api/replica")
+    rep2 = b["replica"]
+    check("replica capture time unchanged by reads",
+          rep2["captured_at"] == capture_epoch
+          and rep2["age_seconds"] >= age1 + 0.9, str((age1, rep2["age_seconds"])))
+
+    # 9.4 once older than the TTL, rejection is a plain 503 again.
+    #     Keep the breaker in OPEN by re-tripping it inside every cooldown so
+    #     the replica can age past its TTL.
+    deadline = time.time() + ttl + 1.0
+    while time.time() < deadline:
+        s, b = proxy(0)
+        if s == 503 and not b.get("degraded"):
+            break  # cooldown active and replica already expired
+        time.sleep(0.4)
+    s, b = req("GET", GW[0] + "/api/replica")
+    check("replica reported expired", b["replica"]["expired"] and not b["replica"]["fresh"], str(b))
+    s, b = proxy(0)
+    check("expired replica -> plain 503, not degraded",
+          s == 503 and not b.get("degraded") and b["reason"] == "circuit_open", str(b))
+    s, b = proxy(1)
+    check("second entry also 503 after expiry", s == 503 and not b.get("degraded"), str(b))
+
+    # 9.5 recovery probe interleaving: one real probe, peers read the replica.
+    set_mode("normal")
+    time.sleep(2.3)  # cooldown elapsed -> the next request is the single probe
+    s, b = proxy(0)
+    check("recovery probe succeeds and restores CLOSED",
+          s == 200 and wait_state("CLOSED") and b["outcome"] == "success", str(b))
+    s, b = req("GET", GW[0] + "/api/replica")
+    check("successful probe refreshed replica (new version, age reset)",
+          b["replica"]["version"] > captured_version and b["replica"]["age_seconds"] < 2,
+          str(b["replica"]))
+    fresh_version = b["replica"]["version"]
+
+    # trip again on hard 5xx (fast, replica stays fresh) and enter HALF_OPEN
+    set_mode("error")
+    for _ in range(3):
+        proxy(0)
+    check("breaker OPEN again for probe-interleave drill", wait_state("OPEN"), str(state()))
+    set_mode("slow")  # the recovery probe will hang until the 2s gateway timeout
+    time.sleep(2.3)   # cooldown elapsed; next request becomes the single probe
+    from threading import Thread
+    holder = {}
+    t = Thread(target=lambda: holder.update(zip(("s", "b"), proxy(0, timeout=8))))
+    t.start()
+    time.sleep(0.6)  # let the probe take off
+    check("single probe in flight", state()["state"] == "HALF_OPEN", str(state()))
+    # the other 7 requests must be fast rejections served from the replica:
+    # none of them may become a probe
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        others = list(pool.map(lambda i: proxy(i % 2), range(7)))
+    check("concurrent peers degraded, never probes",
+          all(o[0] == 200 and o[1].get("degraded") is True
+              and o[1]["reject_reason"] == "probe_in_flight"
+              and o[1]["fallback"]["version"] == fresh_version for o in others),
+          str([(c, x.get("degraded"), x.get("reason") or x.get("reject_reason"))
+               for c, x in others]))
+    t.join(timeout=9)
+    check("the one probe failed (slow upstream) without touching replica",
+          holder["s"] == 504 and holder["b"]["outcome"] == "timeout", str(holder))
+    s, b = req("GET", GW[0] + "/api/replica")
+    check("failed probe did not refresh replica",
+          b["replica"]["version"] == fresh_version, str(b["replica"]))
+    check("breaker re-opened after failed probe", wait_state("OPEN"), str(state()))
+
+    # 9.6 after the failed probe re-opens the breaker, rejection behaviour is
+    #     governed solely by replica freshness. The 2s slow-probe wait plus the
+    #     HALF_OPEN window may have aged the short local-TTL replica past expiry,
+    #     in which case a plain 503 is the correct answer.
+    s, b = proxy(1)
+    _, rep_resp = req("GET", GW[0] + "/api/replica")
+    if rep_resp["replica"]["fresh"]:
+        check("post-probe rejection serves the fresh replica",
+              s == 200 and b.get("degraded") is True
+              and b["fallback"]["version"] == fresh_version, str(b))
+    else:
+        check("aged replica expired -> plain 503 after failed probe",
+              s == 503 and not b.get("degraded") and b["reason"] == "circuit_open", str(b))
+
+    set_mode("normal")
+    time.sleep(2.3)
+    s, b = proxy(0)
+    check("final recovery probe succeeds", s == 200 and wait_state("CLOSED"), str(b))
+    s, b = req("GET", GW[0] + "/api/replica")
+    check("replica fresh again after recovery", b["replica"]["fresh"], str(b["replica"]))
 
     print(f"\n{'='*50}\nRESULT: {PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

@@ -3,17 +3,23 @@
 Forwards GET requests to the flaky upstream through a shared SQLite-backed
 breaker.  Two instances run behind no load balancer: the web UI talks to each
 entry point directly (ports 8001 / 8002) so either instance can be driven.
+
+When the breaker rejects a request but a fresh shared fallback replica exists
+(age <= CB_FALLBACK_TTL_SECONDS, default 30s), the gateway degrades: it serves
+the stored upstream status code and body, clearly marked as a fallback with the
+capture timestamp.  Expired or missing replicas still produce a plain 503.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from .breaker import Breaker
 
@@ -62,6 +68,12 @@ async def api_events(limit: int = 30):
     return {"instance": INSTANCE_ID, "events": breaker.get_events(limit)}
 
 
+@app.get("/api/replica")
+async def api_replica():
+    """The shared fallback replica (or null), including freshness and age."""
+    return {"instance": INSTANCE_ID, "replica": breaker.get_replica()}
+
+
 @app.post("/api/upstream/mode")
 async def api_set_mode(request: Request):
     """Convenience: switch upstream mode through this gateway entry point."""
@@ -91,10 +103,13 @@ async def api_get_mode():
 
 @app.get("/proxy")
 async def proxy():
-    """The guarded GET path."""
+    """The guarded GET path, with shared fallback on breaker rejection."""
     decision = breaker.dispatch()
 
     if decision["action"] == "reject":
+        degraded = _degraded_response(decision["reason"])
+        if degraded is not None:
+            return degraded
         return JSONResponse(
             status_code=503,
             content={
@@ -134,6 +149,7 @@ async def proxy():
         )
 
     if r.status_code >= 500:
+        # A failure never refreshes the fallback replica.
         new_state = breaker.record_failure(decision, f"http_{r.status_code}")
         return JSONResponse(
             status_code=r.status_code,
@@ -146,7 +162,16 @@ async def proxy():
             },
         )
 
-    new_state = breaker.record_success(decision)
+    # Confirmed upstream success: the breaker applies it only when the token
+    # still matches; the replica is refreshed inside that same transaction.
+    content_type = r.headers.get("content-type", "application/json")
+    upstream_packet = {
+        "status_code": r.status_code,
+        "content_type": content_type,
+        "body_text": r.text,
+        "body_is_json": "json" in content_type.lower(),
+    }
+    new_state = breaker.record_success(decision, upstream_packet)
     return JSONResponse(
         status_code=r.status_code,
         content={
@@ -157,6 +182,48 @@ async def proxy():
             "breaker": new_state or breaker.get_state(),
         },
     )
+
+
+def _degraded_response(reason: str) -> Response | None:
+    """Serve the shared fallback replica while the breaker rejects.
+
+    Returns None when no replica exists or it is past its TTL: the caller then
+    issues a normal 503.  Reading the replica never extends its validity.
+    """
+    replica = breaker.get_replica()
+    if replica is None or replica["expired"]:
+        return None
+    headers = {
+        "X-Gateway-Degraded": "1",
+        "X-Replica-Age": str(replica["age_seconds"]),
+        "X-Replica-Captured-At": str(replica["captured_at"]),
+        "X-Replica-Version": str(replica["version"]),
+        # RFC 7234 warning: 110 = Response is stale.
+        "Warning": f'110 {INSTANCE_ID} "fallback replica; captured_at='
+                   f'{_iso_utc(replica["captured_at"])}; age={replica["age_seconds"]}s"',
+    }
+    payload = {
+        "degraded": True,
+        "gateway": INSTANCE_ID,
+        "reject_reason": reason,
+        "fallback": {
+            "upstream_status": replica["status_code"],
+            "upstream_content_type": replica["content_type"],
+            "captured_at": replica["captured_at"],
+            "captured_at_iso": _iso_utc(replica["captured_at"]),
+            "captured_by": replica["captured_by"],
+            "age_seconds": replica["age_seconds"],
+            "ttl_seconds": replica["ttl_seconds"],
+            "remaining_seconds": replica["remaining_seconds"],
+            "version": replica["version"],
+        },
+        "upstream_body": replica["body"],
+    }
+    return JSONResponse(status_code=replica["status_code"], content=payload, headers=headers)
+
+
+def _iso_utc(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).isoformat()
 
 
 def _safe_json(r: httpx.Response):
@@ -195,6 +262,9 @@ INDEX_HTML = """<!doctype html>
   .CLOSED { background:#1a7f37; color:#fff; }
   .OPEN { background:#da3633; color:#fff; }
   .HALF_OPEN { background:#9e6a03; color:#fff; }
+  .DEGRADED { background:#bf6b00; color:#fff; }
+  .FRESH { background:#1a7f37; color:#fff; }
+  .EXPIRED { background:#6e7681; color:#fff; }
   table { width:100%; border-collapse: collapse; font-size: .78rem; }
   th, td { text-align:left; padding: .25rem .35rem; border-bottom:1px solid #2a2f3a;
            vertical-align: top; }
@@ -229,18 +299,26 @@ INDEX_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>3. 发送 GET（经熔断转发）</h2>
+    <h2>3. 发送 GET（经熔断转发；熔断时优先返回共享降级副本）</h2>
     <div class="row">
       <button class="go" onclick="send(1)">发 1 笔</button>
       <button class="go" onclick="send(3)">连发 3 笔</button>
       <button class="go" onclick="send(5)">连发 5 笔</button>
       <button class="go" onclick="send(10)">并发 10 笔</button>
     </div>
-    <pre id="result">（结果显示在这里）</pre>
+    <pre id="result">（结果显示在这里；降级回包带 <b>degraded:true</b> 与采集时间）</pre>
   </div>
 
   <div class="card">
-    <h2>4. 熔断状态 <span id="statepill"></span></h2>
+    <h2>4. 共享降级副本（两实例同一份，读取不续期） <span id="reppill"></span></h2>
+    <pre id="replica">（尚无副本：需先有一笔被网关确认的上游成功）</pre>
+    <p class="muted">仅当熔断拒绝且副本年龄不超过 TTL（默认 30 秒）时才返回降级结果；
+       过期或没有副本仍返回 503。副本只由“确认有效”的上游成功回包刷新，
+       探测失败与迟到成功都不会覆盖它。</p>
+  </div>
+
+  <div class="card">
+    <h2>5. 熔断状态 <span id="statepill"></span></h2>
     <pre id="state"></pre>
     <h2 style="margin-top:.8rem">事件流（两台实例共享）</h2>
     <table><thead><tr><th>#</th><th>距今(s)</th><th>实例</th><th>事件</th><th>详情</th></tr></thead>
@@ -285,17 +363,46 @@ async function send(n) {
     outcomes = [];
     for (let i = 0; i < n; i++) outcomes.push(await sendOne());
   }
-  $("result").textContent = outcomes.map((o, i) =>
-    `#${i+1} HTTP ${o.status}: ` + JSON.stringify(o.body)).join("\\n\\n");
+  $("result").innerHTML = outcomes.map((o, i) => {
+    const tag = (o.body && o.body.degraded)
+      ? ` <span class="pill DEGRADED">降级 fallback · 采集于 ${o.body.fallback.age_seconds}s 前</span>`
+      : "";
+    return `#${i+1} HTTP ${o.status}:${tag}\\n` + JSON.stringify(o.body);
+  }).join("\\n\\n");
   refresh();
+}
+
+function renderReplica(rep) {
+  if (!rep) {
+    $("reppill").innerHTML = "";
+    $("replica").textContent = "（尚无副本）";
+    return;
+  }
+  $("reppill").innerHTML =
+    `<span class="pill ${rep.expired ? "EXPIRED" : "FRESH"}">` +
+    (rep.expired ? "已过期" : "新鲜可降级") + "</span>";
+  $("replica").textContent = JSON.stringify({
+    version: rep.version,
+    upstream_status: rep.status_code,
+    content_type: rep.content_type,
+    captured_at_iso: new Date(rep.captured_at * 1000).toISOString(),
+    captured_by: rep.captured_by,
+    age_seconds: rep.age_seconds,
+    ttl_seconds: rep.ttl_seconds,
+    remaining_seconds: rep.remaining_seconds,
+    epoch: rep.epoch,
+    body: rep.body
+  }, null, 2);
 }
 
 async function refresh() {
   try {
-    const [{body: st}, {body: ev}, up] = await Promise.all([
+    const [{body: st}, {body: ev}, repResp, up] = await Promise.all([
       api("/api/state"), api("/api/events?limit=20"),
+      api("/api/replica"),
       api("/api/upstream/mode").catch(e => ({body: {error: String(e)}}))
     ]);
+    renderReplica(repResp.body && repResp.body.replica);
     $("who").textContent = "当前入口实例: " + st.instance;
     const b = st.breaker;
     $("statepill").innerHTML =
@@ -308,7 +415,9 @@ async function refresh() {
       cooldown_remaining_s: b.cooldown_remaining,
       probe_instance: b.probe_instance,
       probe_age_s: b.probe_started_at != null
-        ? Number((b.now - b.probe_started_at).toFixed(3)) : null
+        ? Number((b.now - b.probe_started_at).toFixed(3)) : null,
+      fallback_ttl_s: b.fallback_ttl_seconds,
+      replica_summary: b.replica
     }, null, 2);
     $("events").innerHTML = (ev.events || []).map(e =>
       `<tr><td>${e.id}</td><td>${e.age}</td><td>${e.instance}</td>

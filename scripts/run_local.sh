@@ -17,6 +17,9 @@ export CB_DB_PATH="$PWD/data/breaker.db"
 export CB_FAILURE_THRESHOLD=3
 export CB_COOLDOWN_SECONDS=2
 export CB_PROBE_TIMEOUT_SECONDS=3
+# Local drills use a short replica TTL so expiry can be observed quickly;
+# docker-compose keeps the production default of 30 seconds.
+export CB_FALLBACK_TTL_SECONDS="${CB_FALLBACK_TTL_SECONDS:-4}"
 
 start() {
   local name="$1" app="$2" port="$3" extra="$4"

@@ -16,10 +16,19 @@ state only when the token still matches:
   * probe token           -> (probe_token, state == HALF_OPEN)
 Late results of superseded requests (or of a probe whose instance died and was
 reclaimed by the other gateway) therefore can never overwrite a newer verdict.
+
+Shared fallback replica
+-----------------------
+A confirmed upstream success (token still valid when the response is applied)
+also refreshes the single shared fallback replica, inside the same exclusive
+transaction.  Failures, stale/late successes and reclaimed probes never touch
+it.  While the breaker rejects a request, callers may serve the replica when
+its age is within FALLBACK_TTL_SECONDS; reads never extend its lifetime.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -33,6 +42,8 @@ COOLDOWN_SECONDS = float(os.getenv("CB_COOLDOWN_SECONDS", "2"))
 # A probe that neither succeeds nor fails within this time may be reclaimed so
 # another instance (or the same one) can start a fresh recovery probe.
 PROBE_TIMEOUT_SECONDS = float(os.getenv("CB_PROBE_TIMEOUT_SECONDS", "3"))
+# A fallback replica older than this must not be served; the request is rejected.
+FALLBACK_TTL_SECONDS = float(os.getenv("CB_FALLBACK_TTL_SECONDS", "30"))
 EVENT_LIMIT = int(os.getenv("CB_EVENT_LIMIT", "100"))
 
 CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
@@ -55,14 +66,37 @@ CREATE TABLE IF NOT EXISTS events (
     kind       TEXT NOT NULL,
     detail     TEXT NOT NULL DEFAULT ''
 );
+-- The single shared fallback replica. Exactly one row (id = 1); absent until
+-- the first confirmed upstream success. `version` grows with every refresh so
+-- callers can tell a newer replica apart from an older one.
+CREATE TABLE IF NOT EXISTS fallback_replica (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    version        INTEGER NOT NULL,
+    status_code    INTEGER NOT NULL,
+    content_type   TEXT NOT NULL,
+    body_text      TEXT NOT NULL,
+    body_is_json   INTEGER NOT NULL,
+    epoch          INTEGER NOT NULL,
+    captured_at_m  REAL NOT NULL,
+    captured_at_w  REAL NOT NULL,
+    captured_by    TEXT NOT NULL
+);
 """
 
 
 class Breaker:
-    def __init__(self, db_path: str, instance_id: str, *, monotonic=time.monotonic):
+    def __init__(
+        self,
+        db_path: str,
+        instance_id: str,
+        *,
+        monotonic=time.monotonic,
+        wall=time.time,
+    ):
         self.db_path = db_path
         self.instance_id = instance_id
         self._monotonic = monotonic
+        self._wall = wall
         self._init_db()
 
     # ------------------------------------------------------------------ infra
@@ -195,8 +229,19 @@ class Breaker:
                     "probe_instance": row["probe_instance"],
                 }
 
-    def record_success(self, decision: dict[str, Any]) -> dict[str, Any] | None:
-        """Apply a successful response. Returns new state dict, or None if stale."""
+    def record_success(
+        self,
+        decision: dict[str, Any],
+        upstream: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply a successful response. Returns new state dict, or None if stale.
+
+        ``upstream`` carries the confirmed upstream success packet
+        (status_code / content_type / body_text / body_is_json). When given and
+        the token still matches, the shared fallback replica is refreshed in
+        the same transaction; a stale/late success never reaches this point and
+        therefore cannot overwrite a newer replica.
+        """
         now = self._monotonic()
         with self._connect() as conn:
             with self._txn(conn):
@@ -219,6 +264,8 @@ class Breaker:
                         (CLOSED,),
                     )
                     self._log(conn, "circuit_closed", "probe succeeded")
+                    if upstream is not None:
+                        self._refresh_replica_locked(conn, upstream)
                     return self._state_locked(conn, now)
 
                 # normal request
@@ -233,7 +280,78 @@ class Breaker:
                         "UPDATE breaker_state SET failure_count=0 WHERE id=1"
                     )
                     self._log(conn, "failure_count_reset", "success in CLOSED state")
+                if upstream is not None:
+                    self._refresh_replica_locked(conn, upstream)
                 return self._state_locked(conn, now)
+
+    def _refresh_replica_locked(
+        self, conn: sqlite3.Connection, upstream: dict[str, Any]
+    ) -> None:
+        """Insert/replace the fallback replica. Caller already holds the txn."""
+        row = conn.execute("SELECT epoch FROM breaker_state WHERE id=1").fetchone()
+        conn.execute(
+            "INSERT INTO fallback_replica (id, version, status_code, content_type, "
+            "body_text, body_is_json, epoch, captured_at_m, captured_at_w, captured_by) "
+            "VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "version=fallback_replica.version+1, status_code=excluded.status_code, "
+            "content_type=excluded.content_type, body_text=excluded.body_text, "
+            "body_is_json=excluded.body_is_json, epoch=excluded.epoch, "
+            "captured_at_m=excluded.captured_at_m, captured_at_w=excluded.captured_at_w, "
+            "captured_by=excluded.captured_by",
+            (
+                int(upstream["status_code"]),
+                upstream.get("content_type", "application/json"),
+                upstream["body_text"],
+                1 if upstream.get("body_is_json") else 0,
+                row["epoch"],
+                self._monotonic(),
+                self._wall(),
+                self.instance_id,
+            ),
+        )
+        self._log(
+            conn,
+            "replica_refreshed",
+            f"upstream {upstream['status_code']} stored as fallback",
+        )
+
+    def get_replica(self, *, include_body: bool = True) -> dict[str, Any] | None:
+        """Return the shared fallback replica with freshness info, or None.
+
+        Reads are pure: the captured timestamp and TTL are never extended.
+        """
+        now = self._monotonic()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM fallback_replica WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            age = now - row["captured_at_m"]
+            out: dict[str, Any] = {
+                "version": row["version"],
+                "status_code": row["status_code"],
+                "content_type": row["content_type"],
+                "epoch": row["epoch"],
+                "captured_at_monotonic": row["captured_at_m"],
+                "captured_at": row["captured_at_w"],
+                "captured_by": row["captured_by"],
+                "age_seconds": round(age, 3),
+                "ttl_seconds": FALLBACK_TTL_SECONDS,
+                "fresh": age <= FALLBACK_TTL_SECONDS,
+                "expired": age > FALLBACK_TTL_SECONDS,
+                "remaining_seconds": round(max(0.0, FALLBACK_TTL_SECONDS - age), 3),
+            }
+            if include_body:
+                if row["body_is_json"]:
+                    try:
+                        out["body"] = json.loads(row["body_text"])
+                    except (ValueError, TypeError):
+                        out["body"] = row["body_text"]
+                else:
+                    out["body"] = row["body_text"]
+            return out
 
     def record_failure(self, decision: dict[str, Any], detail: str) -> dict[str, Any] | None:
         """Apply a failed response / timeout. Returns new state, or None if stale."""
@@ -295,12 +413,38 @@ class Breaker:
         out["cooldown_seconds"] = COOLDOWN_SECONDS
         out["probe_timeout_seconds"] = PROBE_TIMEOUT_SECONDS
         out["failure_threshold"] = FAILURE_THRESHOLD
+        out["fallback_ttl_seconds"] = FALLBACK_TTL_SECONDS
         if out["state"] == OPEN and out["opened_at"] is not None:
             elapsed = now - out["opened_at"]
             out["cooldown_remaining"] = max(0.0, COOLDOWN_SECONDS - elapsed)
         else:
             out["cooldown_remaining"] = 0.0
+        out["replica"] = self._replica_summary_locked(conn, now)
         return out
+
+    def _replica_summary_locked(
+        self, conn: sqlite3.Connection, now: float
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT version, status_code, content_type, epoch, captured_at_m, "
+            "captured_at_w, captured_by FROM fallback_replica WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        age = now - row["captured_at_m"]
+        return {
+            "version": row["version"],
+            "status_code": row["status_code"],
+            "content_type": row["content_type"],
+            "epoch": row["epoch"],
+            "captured_at": row["captured_at_w"],
+            "captured_by": row["captured_by"],
+            "age_seconds": round(age, 3),
+            "ttl_seconds": FALLBACK_TTL_SECONDS,
+            "remaining_seconds": round(max(0.0, FALLBACK_TTL_SECONDS - age), 3),
+            "fresh": age <= FALLBACK_TTL_SECONDS,
+            "expired": age > FALLBACK_TTL_SECONDS,
+        }
 
     def get_state(self) -> dict[str, Any]:
         now = self._monotonic()

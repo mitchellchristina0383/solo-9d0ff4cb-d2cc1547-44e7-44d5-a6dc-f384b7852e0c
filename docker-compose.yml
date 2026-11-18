@@ -27,6 +27,7 @@ services:
       CB_FAILURE_THRESHOLD: "3"
       CB_COOLDOWN_SECONDS: "2"
       CB_PROBE_TIMEOUT_SECONDS: "3"
+      CB_FALLBACK_TTL_SECONDS: "30"
     ports:
       - "8001:8000"
     volumes:
@@ -46,6 +47,7 @@ services:
       CB_FAILURE_THRESHOLD: "3"
       CB_COOLDOWN_SECONDS: "2"
       CB_PROBE_TIMEOUT_SECONDS: "3"
+      CB_FALLBACK_TTL_SECONDS: "30"
     ports:
       - "8002:8000"
     volumes:
