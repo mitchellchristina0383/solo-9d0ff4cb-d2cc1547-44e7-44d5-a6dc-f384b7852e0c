@@ -1,0 +1,55 @@
+services:
+  upstream:
+    build:
+      context: ./app
+    command: uvicorn app.upstream_app:app --host 0.0.0.0 --port 8000
+    environment:
+      UPSTREAM_SLOW_DELAY: "5"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  gateway1:
+    build:
+      context: ./app
+    depends_on:
+      upstream:
+        condition: service_healthy
+    environment:
+      INSTANCE_ID: "gateway-1"
+      UPSTREAM_URL: "http://upstream:8000"
+      UPSTREAM_TIMEOUT: "2"
+      CB_DB_PATH: "/data/breaker.db"
+      CB_FAILURE_THRESHOLD: "3"
+      CB_COOLDOWN_SECONDS: "2"
+      CB_PROBE_TIMEOUT_SECONDS: "3"
+    ports:
+      - "8001:8000"
+    volumes:
+      - breaker-data:/data
+
+  gateway2:
+    build:
+      context: ./app
+    depends_on:
+      upstream:
+        condition: service_healthy
+    environment:
+      INSTANCE_ID: "gateway-2"
+      UPSTREAM_URL: "http://upstream:8000"
+      UPSTREAM_TIMEOUT: "2"
+      CB_DB_PATH: "/data/breaker.db"
+      CB_FAILURE_THRESHOLD: "3"
+      CB_COOLDOWN_SECONDS: "2"
+      CB_PROBE_TIMEOUT_SECONDS: "3"
+    ports:
+      - "8002:8000"
+    volumes:
+      - breaker-data:/data
+
+volumes:
+  breaker-data:
